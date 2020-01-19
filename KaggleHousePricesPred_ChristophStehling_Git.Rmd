@@ -1,0 +1,1034 @@
+---
+title: "1st Assignment"
+output: 
+  html_document:
+    toc: true
+    toc_depth: 3
+author: Christoph Stehling
+---
+
+WARNING: When trying to run all codes chunks of the section "Feature Selection" from "the outside" without going into the code chunks, you'll receive an error message like "Warning in preProcess.default(thresh = 0.95, k = 5, freqCut = 19, uniqueCut = 10,  :
+  These variables have zero variances: RoofStyleShed, Exterior2ndOther, FoundationWood, GarageYrBlt1875, GarageYrBlt1890, GarageYrBlt1895, GarageYrBlt1896, GarageYrBlt1902, GarageYrBlt1905, GarageYrBlt1906, GarageYrBlt1907, GarageYrBlt1917, GarageYrBlt1918, GarageYrBlt1927, GarageYrBlt1932, GarageYrBlt1938, GarageYrBlt1943, GarageYrBlt1951, GarageYrBlt2207"
+  
+TO RUN IT CORRECTLY AND TO NOT RECEIVE AN ERROR MESSAGE, please open the feature selection and run code chunk for code chunk. (Running all code chunks from the outside still work to create the submission csv.)
+
+# Importing Libraries
+```{r}
+library(binr)
+library(rbin)
+library(data.table)
+library(ggplot2)
+library(plyr)
+library(dplyr)     # To compute the `union` of the levels.
+library(png)       # To include images in this document.
+library(knitr)     # To include images inline in this doc.
+library(moments)   # Skewness
+library(e1071)     # Alternative for Skewness
+library(glmnet)    # Lasso
+library(caret)     # To enable Lasso training with CV.
+```
+
+# Introduction
+ <https://www.kaggle.com/c/house-prices-advanced-regression-techniques>.
+# Data Reading
+
+```{r Load Data}
+original_training_data = read.csv(file = file.path("/Users/chrs/Desktop/IE/ML II/First_Assignment/house-prices-advanced-regression-techniques/train.csv"))
+original_test_data = read.csv(file = file.path("/Users/chrs/Desktop/IE/ML II/First_Assignment/house-prices-advanced-regression-techniques/test.csv"))
+original_training_data_copy <- copy(original_training_data)
+```
+
+The dataset is offered in two separated fields, one for the training and another one for the test set. 
+
+To avoid applying the Feature Engineering process two times (once for training and once for test), I joined both datasets (using the `rbind` function), apply your FE and then split the datasets again. However, if we try to do join the two dataframes as they are, we will get an error because they do not have the same columns: `test_data` does not have a column `SalePrice`. Therefore, we first create this column in the test set and then we join the data.
+
+```{r Joinning datasets}
+original_test_data$SalePrice <- 0
+dataset <- rbind(original_training_data, original_test_data)
+```
+
+# Useful Functions: Baseline Model & Train/Validation Split
+
+In order to facilitate the evaluation of the impact of the different steps, I am going to place the code for creating a baseline `glm` model in a function. Now I can call it again and again without having to re-write everything. The only thing that changes from one case to another is the dataset that is used to train the model.
+
+```{r message=FALSE, warning=FALSE}
+lm.model <- function(training_dataset, validation_dataset, title) {
+  # Create a training control configuration that applies a 5-fold cross validation
+  train_control_config <- trainControl(method = "repeatedcv", 
+                                       number = 5, 
+                                       repeats = 1,
+                                       returnResamp = "all")
+
+  # Fit a glm model to the input training data
+  this.model <- train(SalePrice ~ ., 
+                       data = training_dataset, 
+                       method = "glm", 
+                       metric = "RMSE",
+                       preProc = c("center", "scale"),
+                       trControl=train_control_config)
+  
+  # Prediction
+  this.model.pred <- predict(this.model, validation_dataset)
+  this.model.pred[is.na(this.model.pred)] <- 0 # To avoid null predictions
+  
+  # RMSE of the model
+  thismodel.rmse <- sqrt(mean((this.model.pred - validation_dataset$SalePrice)^2))
+  
+  # Error in terms of the mean deviation between the predicted value and the price of the houses
+  thismodel.price_error <- mean(abs((exp(this.model.pred) -1) - (exp(validation_dataset$SalePrice) -1)))
+
+  # Plot the predicted values against the actual prices of the houses
+  my_data <- as.data.frame(cbind(predicted=(exp(this.model.pred) -1), observed=(exp(validation_dataset$SalePrice) -1)))
+  ggplot(my_data, aes(predicted, observed)) +
+    geom_point() + geom_smooth(method = "lm") +
+    labs(x="Predicted") +
+    ggtitle(ggtitle(paste(title, 'RMSE: ', format(round(thismodel.rmse, 4), nsmall=4), ' --> Price ERROR:', format(round(thismodel.price_error, 0), nsmall=0), 
+                          ' €', sep=''))) +  
+    scale_x_continuous(labels = scales::comma) + 
+    scale_y_continuous(labels = scales::comma)
+}
+```
+
+
+```{r}
+splitdf <- function(dataframe) {
+  set.seed(123)
+ 	index <- 1:nrow(dataframe)
+ 	trainindex <- sample(index, trunc(length(index)/1.5))
+ 	trainset <- dataframe[trainindex, ]
+ 	validationset <- dataframe[-trainindex, ]
+ 	list(trainset=trainset,validationset=validationset)
+}
+```
+
+# Pre-Cleaning Analysis
+##Summary
+Let's now visualize the dataset to see where to begin
+```{r Dataset Visualization}
+summary(dataset)
+```
+We can see some problems just by taking a look to the summary: the dataset has missing values, there are some categorical columns codified as numeric, it has different scales for the feature values. 
+
+We need to be careful whether including SaleType in the final model as it could cause information spill. Should we try to use this model to predict future house sales we won't know the sale type in advance. In this model I will include it.
+
+##Class of Each Column
+```{r}
+lapply(dataset, class)
+```
+
+# Data Cleaning
+## Removing Meaningless Columns
+
+We remove Utilities as there is only one value deviating from the most column value. ID is only a unique identifier, therefore naturally does possess any predictiv power and is deleted as well.
+
+```{r NA transformation}
+dataset <- dataset[,-which(names(dataset) == "Utilities")]
+dataset <- dataset[,-which(names(dataset) == "Id")]
+```
+
+## Hunting and Removing NAs
+
+Firstly, we perform a count giving us all the columns containing null values.
+
+```{r NAs discovery}
+na.cols <- which(colSums(is.na(dataset)) > 0)
+paste('There are', length(na.cols), 'columns with missing values')
+sort(colSums(sapply(dataset[na.cols], is.na)), decreasing = TRUE)
+```
+
+Taking a look at the data secription, not all NAs correspond to missing values but indicate that an NA means non  existent - therefore I am recoding these NAs with a 0, starting with categorical values. 
+
+```{r}
+#Replacing categorical (class = factor) NA values with "No" where NA means non-existent - in accordance with data description.
+#First step: adding a new factor "None".
+#Second Step: replacing NA values with new factor "None".
+
+# NA in Alley means "No alley access"
+dataset$Alley = factor(dataset$Alley, levels=c(levels(dataset$Alley), "None"))
+dataset$Alley[is.na(dataset$Alley)] = "None"
+
+# Bsmt : NA for basement features is "no basement"
+dataset$BsmtQual = factor(dataset$BsmtQual, levels=c(levels(dataset$BsmtQual), "None"))
+dataset$BsmtQual[is.na(dataset$BsmtQual)] = "None"
+
+dataset$BsmtCond = factor(dataset$BsmtCond, levels=c(levels(dataset$BsmtCond), "None"))
+dataset$BsmtCond[is.na(dataset$BsmtCond)] = "None"
+
+dataset$BsmtExposure = factor(dataset$BsmtExposure, levels=c(levels(dataset$BsmtExposure), "None"))
+dataset$BsmtExposure[is.na(dataset$BsmtExposure)] = "None"
+
+dataset$BsmtFinType1 = factor(dataset$BsmtFinType1, levels=c(levels(dataset$BsmtFinType1), "None"))
+dataset$BsmtFinType1[is.na(dataset$BsmtFinType1)] = "None"
+
+dataset$BsmtFinType2 = factor(dataset$BsmtFinType2, levels=c(levels(dataset$BsmtFinType2), "None"))
+dataset$BsmtFinType2[is.na(dataset$BsmtFinType2)] = "None"
+
+# Fence : NA means "no fence"
+dataset$Fence = factor(dataset$Fence, levels=c(levels(dataset$Fence), "None"))
+dataset$Fence[is.na(dataset$Fence)] = "None"
+
+# FireplaceQu : NA means "no fireplace"
+dataset$FireplaceQu = factor(dataset$FireplaceQu, levels=c(levels(dataset$FireplaceQu), "None"))
+dataset$FireplaceQu[is.na(dataset$FireplaceQu)] = "None"
+
+# Garage : NA for garage features is "no garage"
+dataset$GarageType = factor(dataset$GarageType, levels=c(levels(dataset$GarageType), "None"))
+dataset$GarageType[is.na(dataset$GarageType)] = "None"
+
+dataset$GarageFinish = factor(dataset$GarageFinish, levels=c(levels(dataset$GarageFinish), "None"))
+dataset$GarageFinish[is.na(dataset$GarageFinish)] = "None"
+
+dataset$GarageQual = factor(dataset$GarageQual, levels=c(levels(dataset$GarageQual), "None"))
+dataset$GarageQual[is.na(dataset$GarageQual)] = "None"
+
+dataset$GarageCond = factor(dataset$GarageCond, levels=c(levels(dataset$GarageCond), "None"))
+dataset$GarageCond[is.na(dataset$GarageCond)] = "None"
+
+# PoolQC : data description says NA means "no pool"
+dataset$PoolQC = factor(dataset$PoolQC, levels=c(levels(dataset$PoolQC), "None"))
+dataset$PoolQC[is.na(dataset$PoolQC)] = "None"
+
+# MiscFeature : NA = "no misc feature"
+dataset$MiscFeature = factor(dataset$MiscFeature, levels=c(levels(dataset$MiscFeature), "None"))
+dataset$MiscFeature[is.na(dataset$MiscFeature)] = "None"
+
+# MasVnrType : NA most likely means no veneer
+dataset$MasVnrType[is.na(dataset$MasVnrType)] = "None"
+```
+
+Double checking null values.
+
+```{r NAs discovery}
+na.cols <- which(colSums(is.na(dataset)) > 0)
+paste('There are', length(na.cols), 'columns with missing values')
+sort(colSums(sapply(dataset[na.cols], is.na)), decreasing = TRUE)
+```
+
+Moreover, it can be noticed that there are a lot of variables where only one, two or four entries are missing. Most likely those are input errors. Moreover, and a big majority of the variable is made up of one value. Therefore, I decide to impute the most common value.
+
+```{r}
+#Electrical
+table(dataset$Electrical) #Only one value missing, most occuring value by far = SBrkr. Imputing SBrkr for NA
+dataset$Electrical[is.na(dataset$Electrical)] = "SBrkr"
+
+#Functional
+table(dataset$Functional) #Only two value missing, most occuring value by far = Typ. Imputing Typ for NA
+dataset$Functional[is.na(dataset$Functional)] = "Typ"
+
+#KitchenQual
+table(dataset$KitchenQual) #Only one value missing, most occuring value by far = TA. Imputing TA for NA
+dataset$KitchenQual[is.na(dataset$KitchenQual)] = "TA"
+
+#SaleType
+table(dataset$SaleType) #Only one value missing, most occuring value by far = WD. Imputing WD for NA
+dataset$SaleType[is.na(dataset$SaleType)] = "WD"
+
+#Exterior1st
+table(dataset$Exterior1st) #Only one value missing, most occuring value by far = VinylSd. Imputing VinylSd for NA
+dataset$Exterior1st[is.na(dataset$Exterior1st)] = "VinylSd"
+
+#Exterior2nd
+table(dataset$Exterior2nd) #Only one value missing, most occuring value by far = VinylSd. Imputing VinylSd for NA
+dataset$Exterior2nd[is.na(dataset$Exterior2nd)] = "VinylSd"
+
+#MSZoning: Only four values missing. ~78% of the the MSZoning = RL, therefore I decide to impute RL for 4 missing values
+dataset[is.na(dataset$MSZoning),]
+table(dataset$MSZoning)
+nrow(dataset[dataset$MSZoning == "RL",]) / nrow(dataset) 
+dataset$MSZoning[is.na(dataset$MSZoning)] = "RL"
+```
+
+
+
+```{r}
+# GarageYrBlt: It seems reasonable that most houses would build a garage when the house itself was built.
+dataset$GarageYrBlt[is.na(dataset$GarageYrBlt)] <- dataset$YearBuilt[is.na(dataset$GarageYrBlt)]
+
+#BsmtFullBath: Entries with BsmtFullBath == NAs do not have a basement, therefore I'll impute a 0
+dataset[is.na(dataset$BsmtFullBath),] 
+dataset$BsmtFullBath[is.na(dataset$BsmtFullBath)] <- 0
+dataset$BsmtHalfBath[is.na(dataset$BsmtHalfBath)] <- 0
+
+#Basement Squarefeet NA values belong to the same entry, which do not have a basement anyway, therefore I'll impute a 0
+dataset[is.na(dataset$BsmtFinSF1),]
+dataset[is.na(dataset$BsmtFinSF2),]
+dataset[is.na(dataset$BsmtUnfSF),]
+dataset[is.na(dataset$TotalBsmtSF),]
+dataset$BsmtFinSF1[is.na(dataset$BsmtFinSF1)] <- 0
+dataset$BsmtFinSF2[is.na(dataset$BsmtFinSF2)] <- 0
+dataset$BsmtUnfSF[is.na(dataset$BsmtUnfSF)] <- 0
+dataset$TotalBsmtSF[is.na(dataset$TotalBsmtSF)] <-0
+
+#Garage NA values belong to the same entry, which do not have a garage anyway, therefore I'll impute a 0
+dataset[is.na(dataset$GarageCars),]
+dataset[is.na(dataset$GarageArea),]
+dataset$GarageCars[is.na(dataset$GarageCars)] <- 0
+dataset$GarageArea[is.na(dataset$GarageArea)] <- 0
+
+#MasVNRArea NA values belong to the same entry, which do not have a Vnr anyway, therefore I'll impute a 0
+dataset[is.na(dataset$MasVnrArea),]
+dataset$MasVnrArea[is.na(dataset$MasVnrArea)] <- 0
+```
+
+Doublecheck the amount of null values
+
+```{r NAs discovery}
+na.cols <- which(colSums(is.na(dataset)) > 0)
+paste('There are', length(na.cols), 'columns with missing values')
+sort(colSums(sapply(dataset[na.cols], is.na)), decreasing = TRUE)
+```
+
+The only variable with NAs left: LotFrontage. 
+
+## Factorize Features
+
+Some of the numerical values actually represent categories and therefore need to be recoded as factors.
+
+```{r}
+dataset$MoSold<- factor(dataset$MoSold)
+dataset$GarageYrBlt <- factor(dataset$GarageYrBlt)
+dataset$MSSubClass <- factor(dataset$MSSubClass)
+```
+
+
+## Numericalizing Features
+
+Some of the categorical variables actually indidcate a ranking of quality among the variables. Therefore, I am recoding those variables as numerics starting with a 0 if a the feature is non-existent and going then up from 1 to 5 (or 6 or 7 depending on the feature) with higher numbers indicating a better quality.
+
+```{r}
+dataset$ExterQual <- as.numeric(factor(dataset$ExterQual, levels=c("None","Po","Fa", "TA", "Gd", "Ex")))
+dataset$ExterCond <- as.numeric(factor(dataset$ExterCond , levels=c("None","Po","Fa", "TA", "Gd", "Ex")))
+dataset$BsmtQual <- as.numeric(factor(dataset$BsmtQual, levels=c("None","Po", "Fa", "TA", "Gd", "Ex")))
+dataset$BsmtCond <- as.numeric(factor(dataset$BsmtCond, levels=c("None","Po", "Fa", "TA", "Gd", "Ex")))
+dataset$BsmtExposure <- as.numeric(factor(dataset$BsmtExposure, levels=c("None","No", "Mn", "Av", "Gd")))
+dataset$BsmtFinType1 <- as.numeric(factor(dataset$BsmtFinType1, levels=c("None","Unf","LwQ","Rec","BLQ","ALQ","GLQ")))
+dataset$BsmtFinType2 <- as.numeric(factor(dataset$BsmtFinType2, levels=c("None","Unf","LwQ","Rec","BLQ","ALQ","GLQ")))
+dataset$HeatingQC <- as.numeric(factor(dataset$HeatingQC, levels=c("None","Po", "Fa", "TA", "Gd", "Ex")))
+dataset$KitchenQual <- as.numeric(factor(dataset$KitchenQual, levels=c("None","Po", "Fa", "TA", "Gd", "Ex")))
+dataset$FireplaceQu <- as.numeric(factor(dataset$FireplaceQu, levels=c("None","Po", "Fa", "TA", "Gd", "Ex")))
+dataset$GarageQual <- as.numeric(factor(dataset$GarageQual, levels=c("None","Po", "Fa", "TA", "Gd", "Ex")))
+dataset$GarageCond <- as.numeric(factor(dataset$GarageCond, levels=c("None","Po", "Fa", "TA", "Gd", "Ex")))
+dataset$PoolQC <- as.numeric(factor(dataset$PoolQC, levels=c("None", "Fa", "TA", "Gd", "Ex")))
+dataset$Functional <- as.numeric(factor(dataset$Functional, levels=c("None","Sev","Maj2","Maj1","Mod","Min2","Min1","Typ"))) 
+dataset$GarageFinish <- as.numeric(factor(dataset$GarageFinish, levels = c("None", "Unf","RFn","Fin")))
+dataset$Fence <- as.numeric(factor(dataset$Fence, levels=c("None","MnWw","GdWo","MnPrv","GdPrv")))
+```
+
+## Predicting LotFrontage 
+
+Since LotFrontage has more than 400 missing values, I tried to avoid simply replacing it by a zero since that also did not seem logical taking into account that a lot of houses had a value for LotArea but then an NA for LotFrontage.
+
+Thanks to a bit of research, I found the below idea to predict LotFrontage with a model. However, instead of using a support vector machine like the creator of the idea, I decided to use a linear model.
+
+https://www.kaggle.com/ogakulov/lotfrontage-fill-in-missing-values-house-prices
+LotArea - Clearly should have a significant correlation with LotFrontage. This relationship would not be linear, but some 2nd degree polynomial. If all lots were exactly square, then  LotFrontage=LotArea‾‾‾‾‾‾‾‾√  and we'd be done :)
+LotConfig - Corner unit will likely have a larger LotFrontage than Inside lots. Similarly, CulDSac will have a circular shape of its LotFrontage.
+LotShape - Regular and irregular lots likely have different relationships between LotFrontage and LotArea.
+Alley - This may indicate, along with other variables, the geometry of the lot (e.g. garage facing the alley, will not influence Lot Frontage)
+MSZoning - High and low density residentials zones may have different LotFrontage values.
+BldgType - Townhouse has a much more narrow footprint than a detached house. This should affect LotFrontage quite a bit.
+Neighborhood - Different parts of the city may have different standard for LotArea and LotFrontage.
+Condition1 & Condition2 - Can serve as markers for lot location within the neighbourhood (e.g. lots within same block are similar in size and LotFrontage)
+GarageType - Garage must have direct access to street, which should influence LotFrontage. Unless of course the garage is facing the alley.
+GarageCars - Number of cars that fit in the garage will also affect the Lot Frontage, similar to GarageType.
+Not Including Conition 1 & 2 as they have an amost zero variance which confuses a glm model.
+
+
+```{r}
+lotf_features <- c("LotArea", "LotConfig", "LotShape", "Alley", "MSZoning", "BldgType", "Neighborhood", "GarageType", "GarageCars", "LotFrontage") 
+lotf_dataset <- dataset[,lotf_features]
+lotf_dataset_complete <- lotf_dataset[complete.cases(lotf_dataset),] #removing LotFrontage NA values for model creation
+```
+
+```{r Train Validation split}
+lotf_splits <- splitdf(lotf_dataset_complete)
+lotf_training <- lotf_splits$trainset
+lotf_validation <- lotf_splits$testset
+```
+
+Now I am going to perform a prediction with our baseline model to predict and impute the predicted values for LotFrontage prior to performing any feature selection.
+
+```{r}
+#Trainings Configuration
+train_control_config <- trainControl(method = "repeatedcv", 
+                                       number = 5, 
+                                       repeats = 1,
+                                       returnResamp = "all")  
+#Predicting values
+this.model <- train(LotFrontage ~ ., 
+                       data = lotf_training, 
+                       method = "lm", 
+                       metric = "RMSE",
+                       preProc = c("center", "scale"),
+                       trControl=train_control_config)
+  
+  # Prediction
+  this.model.pred <- predict(this.model, dataset[is.na(dataset$LotFrontage),]) #get predicted values for LotFrontage
+  df.this.model.pred <- data.frame(this.model.pred) #get IDs for predicted values
+  dataset$LotFrontage[is.na(dataset$LotFrontage)] = df.this.model.pred$this.model.pred
+```
+
+
+Doublecheck missing values
+
+```{r}
+na.cols <- which(colSums(is.na(dataset)) > 0)
+paste('There are', length(na.cols), 'columns with missing values')
+```
+
+The dataset has successfully cleaned of all missing values.
+
+# Feature Creation
+## Features related to the size of the house, amount of bedrooms etc.
+
+The original dataset provides a lot of variables splitting the houses in it's different floors, outdoor area and bathrooms across the different floors. Here, I combine some of these features into more complete features such as the total amount of the bathrooms.
+
+```{r}
+#Amount of bathrooms total
+dataset[["BathroomsTotal"]] <- dataset[["BsmtFullBath"]] + (0.5 * dataset[["BsmtHalfBath"]]) + dataset[["FullBath"]] + (0.5 * dataset[["HalfBath"]])
+
+#Total amount of living space inside
+dataset$SFTotalLiveSF <- dataset$X1stFlrSF + dataset$X2ndFlrSF
+
+#Total amount of living space inside including basement
+dataset$SFTotal <- dataset$SFTotalLiveSF + dataset$TotalBsmtSF
+
+#Total amount of porch space
+dataset[["PorchTotal"]] <- dataset[["OpenPorchSF"]] + dataset[["EnclosedPorch"]] + dataset[["X3SsnPorch"]] + dataset[["ScreenPorch"]]
+
+#Total amount of space of the house
+dataset$HouseTotal <- dataset$SFTotal + dataset$PorchTotal
+```
+
+## Quality indicating features
+
+Based on my assumption that qualities score might potentially biased as they are given by humans and I imagine that quality scores in general are rarely representing the actual quality consistently, I created binary features out of all the variables which indicate quality or condition: good (-> 1) or bad condition (-> 0).
+Good quality from >= 3 since 0 is part of the many variables which stands for "non-existent".
+Bad quality from < 3.
+
+As this transformation practically speaking creates categories, good and bad, I factorized the newly created variables.
+
+```{r}
+dataset['IsExterQualBad'] <- as.factor(ifelse(dataset$ExterQual< 3, 1, 0))
+dataset['IsExterQualGood'] <- as.factor(ifelse(dataset$ExterQual >= 3, 1, 0))
+
+dataset['IsExterCondlBad'] <- as.factor(ifelse(dataset$ExterCond< 3, 1, 0))
+dataset['IsExterCondlGood'] <- as.factor(ifelse(dataset$ExterCond >= 3, 1, 0))
+
+dataset['IsBsmtQualBad'] <- as.factor(ifelse(dataset$BsmtQual< 3, 1, 0))
+dataset['IsBsmtQualGood'] <- as.factor(ifelse(dataset$BsmtQual >= 3, 1, 0))
+
+dataset['IsBsmtCondBad'] <- as.factor(ifelse(dataset$BsmtCond< 3, 1, 0))
+dataset['IsBsmtCondGood'] <- as.factor(ifelse(dataset$BsmtCond >= 3, 1, 0))
+
+dataset['IsBsmtExposureBad'] <- as.factor(ifelse(dataset$BsmtExposure< 3, 1, 0))
+dataset['IsBsmtExposureGood'] <- as.factor(ifelse(dataset$BsmtExposure >= 3, 1, 0))
+
+dataset['IsHeatingQCBad'] <- as.factor(ifelse(dataset$HeatingQC< 3, 1, 0))
+dataset['IsHeatingQCGood'] <- as.factor(ifelse(dataset$HeatingQC >= 3, 1, 0))
+
+dataset['IsKitchenQualBad'] <- as.factor(ifelse(dataset$KitchenQual< 3, 1, 0))
+dataset['IsKitchenQualGood'] <- as.factor(ifelse(dataset$KitchenQual >= 3, 1, 0))
+
+dataset['IsFireplaceQuBad'] <- as.factor(ifelse(dataset$FireplaceQu< 3, 1, 0))
+dataset['IsFireplaceQuGood'] <- as.factor(ifelse(dataset$FireplaceQu >= 3, 1, 0))
+
+dataset['IsGarageQualBad'] <- as.factor(ifelse(dataset$GarageQual< 3, 1, 0))
+dataset['IsGarageQualGood'] <- as.factor(ifelse(dataset$GarageQual >= 3, 1, 0))
+
+dataset['IsGarageCondBad'] <- as.factor(ifelse(dataset$GarageCond< 3, 1, 0))
+dataset['IsGarageCondGood'] <- as.factor(ifelse(dataset$GarageCond >= 3, 1, 0))
+
+dataset['IsPoolQCBad'] <- as.factor(ifelse(dataset$PoolQC< 3, 1, 0))
+dataset['IsPoolQCGood'] <- as.factor(ifelse(dataset$PoolQC >= 3, 1, 0))
+
+dataset['QualityCondition'] <- dataset$OverallQual + dataset$OverallCond
+```
+
+## Age of House and Remodelling Related Features
+
+Creating a binary variable indicating if the house has been remodelled since it's been built since renodelling a house is usually quite expensive and potentially adds a lot of value to the house.
+```{r}
+dataset$Remodelled <- ifelse(dataset$YearBuilt != dataset$YearRemodAdd, 1, 0)
+```
+
+Creating a numerical value with amount of years that have been passed since the house has been remodelled the last time before it got sold.
+```{r}
+dataset$RemodelledLast <- dataset$YrSold - dataset$YearRemodAdd
+```
+
+Calculating a numerical value representing the age of the house at the time of the sell.
+```{r}
+dataset$HouseAge <- dataset$YrSold - dataset$YearBuilt
+```
+
+## Season of Sell
+
+According to an article in "Mortage Reports" there are significant differences in prices that can be achieved during the different seasons of a year. Therefore, I am going to bin the the months of the sell into the northern meteorological seasons.     
+https://themortgagereports.com/44135/whats-the-best-time-of-year-to-sell-a-home
+https://www.timeanddate.com/calendar/aboutseasons.html
+1 = Spring
+2 = Summer
+3 = Fall
+4 = Winter
+
+```{r}
+dataset$SeasonSold <- as.factor(recode(dataset$MoSold, "3" = 1, "4" = 1, "5" = 1, "6" = 2, "7" = 2, "8" = 2, "9" = 3, "10" = 3, "11" = 3, "12" = 4, "1" = 4, "2" = 4))
+```
+
+However, another article in "Set Schedule" mentions that "that the last months of any season are the weakest markets to sell a house". Based on this claim I create another binary variable "SoldLastMoSeason" indicating wheter the house was sold during the last month of a season.
+https://www.setschedule.com/did-you-choose-worst-month-to-sell-a-house/
+
+```{r}
+dataset$SoldLastMoSeason <- recode(dataset$MoSold, "3" = 0, "4" = 0, "5" = 1, "6" = 0, "7" = 0, "8" = 1, "9" = 0, "10" = 0, "11" = 1, "12" = 0, "1" = 0, "2" = 1)
+```
+
+## Binarizing Features
+
+As I already noticed during data imputation, there are a lot of features where one instance makes up the greatest majority of features. Those features I am binarizing. A possible assumption could be that the most common value represents the a certain standard practice and a deviation from it could lead to botha decrease or increase in price.
+
+```{r}
+#Checking which categorical values consist maninly of one factor. Some put in comments since I decided to delte them later
+f <- sapply(dataset, is.factor)
+apply(dataset[, f],  2, table)
+
+dataset$LandContourIsLvl <- as.factor(ifelse(dataset$LandContour == "Lvl", 1, 0))
+dataset$LandSlopeIsGtl <-  as.factor(ifelse(dataset$LandSlope == "Gtl", 1, 0))
+dataset$Condition1IsNorm <-  as.factor(ifelse(dataset$Condition1 == "Norm", 1, 0))
+dataset$BldgTypeIs1Fam <-  as.factor(ifelse(dataset$BldgType == "1Fam", 1, 0))
+dataset$RoofStyleIsGable <- as.factor(ifelse(dataset$RoofStyle == "Gable", 1, 0))
+dataset$PavedDriveIsPaved <- as.factor(ifelse(dataset$PavedDrive == "Paved", 1, 0))
+dataset$ElectricalIsSBrkr <- as.factor(ifelse(dataset$Electrical == "SBrkr", 1, 0))
+dataset$CentralAirIsY <- as.factor(ifelse(dataset$CentralAir == "Y", 1, 0))
+dataset$MiscFeatureExisting <- as.factor(ifelse(dataset$MiscFeature == "None", 0, 1)) 
+dataset$SaleTypeIsWD <- as.factor(ifelse(dataset$SaleType == "WD", 1, 0)) #As mentioned, here we got to be cautios whether to include this information in the final model: potential information spill.
+```
+
+### Rich Neighborhoods
+My first assumption was that there is constant difference in sales prices and that therefore I would divide the Neighborhoods in n quantiles. However, as I inspected the data, I noticed that NoRidge, NridgHt and StoneBR are significantly more expensive in the median than the other neighborhoods. While all the other neighborhood prices are dropping in steps of ~5.000 dollar the difference between the StoneBr, the cheapest of the three most expensive neighborhoods, and Timber the most expensive neighborhood right after StoneBr is almost ~70.000 dollar. Such a behavior of the median price cannot be observed for the more affordable neighborhoods. 
+Therefore, I decided to binarize the the neighborhoods into afluent and non-afluent.
+
+```{r}
+dataset_nghbhd <- original_training_data_copy[,c("Neighborhood", "SalePrice")]
+nghbhd_dt <- data.table(dataset_nghbhd)
+
+AvgSaleArea <- nghbhd_dt[, list(AverageSalePrice = mean(SalePrice)), 
+   by = "Neighborhood"][order(-AverageSalePrice)]
+
+AvgSaleArea %>%
+    mutate(quantile = ntile(AverageSalePrice, 3))
+
+dataset$NeighborhoodIsAffluent <- as.factor(ifelse(dataset$Neighborhood == c("NoRidge", "NridgHt", "StoneBr"), 1, 0))
+```
+
+
+
+## Binning numeric features
+
+```{r}
+#finding numeric features
+n <- sapply(dataset, is.numeric)
+dataset[,n]
+
+#LotArea
+ApplyQuintiles <- function(x) {
+  cut(x, breaks=c(quantile(dataset$LotArea, probs = seq(0, 1, by = 0.20))), 
+      labels=c("1","2","3","4","5"), include.lowest=TRUE)
+}
+dataset$LotAreaQBin <- sapply(dataset$LotArea, ApplyQuintiles)
+
+#SFTotal
+ApplyQuintiles <- function(x) {
+  cut(x, breaks=c(quantile(dataset$SFTotal, probs = seq(0, 1, by = 0.20))), 
+      labels=c("1","2","3","4","5"), include.lowest=TRUE)
+}
+dataset$SFTotalQBin <- sapply(dataset$SFTotal, ApplyQuintiles)
+
+#SFTotalLiveSF
+ApplyQuintiles <- function(x) {
+  cut(x, breaks=c(quantile(dataset$SFTotalLiveSF, probs = seq(0, 1, by = 0.20))), 
+      labels=c("1","2","3","4","5"), include.lowest=TRUE)
+}
+dataset$SFTotalLiveSFQBin <- sapply(dataset$SFTotalLiveSF, ApplyQuintiles)
+
+#HouseAge
+ApplyQuintiles <- function(x) {
+  cut(x, breaks=c(quantile(dataset$HouseAge, probs = seq(0, 1, by = 0.20))), 
+      labels=c("1","2","3","4","5"), include.lowest=TRUE)
+}
+dataset$HouseAgeQBin <- sapply(dataset$HouseAge, ApplyQuintiles)
+
+#HouseTotal
+ApplyQuintiles <- function(x) {
+  cut(x, breaks=c(quantile(dataset$HouseTotal, probs = seq(0, 1, by = 0.20))), 
+      labels=c("1","2","3","4","5"), include.lowest=TRUE)
+}
+dataset$HouseTotalQBin <- sapply(dataset$HouseTotal, ApplyQuintiles)
+
+#MasVnrArea
+ApplyQuintiles <- function(x) {
+  cut(x, breaks=c(unique(quantile(dataset$MasVnrArea, probs = seq(0, 1, by = 0.20)))), 
+      labels=c("1","2"), include.lowest=TRUE)
+}
+dataset$MasVnrAreaQBin <- sapply(dataset$MasVnrArea, ApplyQuintiles)
+
+#TotalBsmtSF
+ApplyQuintiles <- function(x) {
+  cut(x, breaks=c(quantile(dataset$TotalBsmtSF, probs = seq(0, 1, by = 0.20))), 
+      labels=c("1","2","3","4","5"), include.lowest=TRUE)
+}
+dataset$TotalBsmtSFQBin <- sapply(dataset$TotalBsmtSF, ApplyQuintiles)
+
+#GarageArea
+ApplyQuintiles <- function(x) {
+  cut(x, breaks=c(quantile(dataset$GarageArea, probs = seq(0, 1, by = 0.20))), 
+      labels=c("1","2","3","4","5"), include.lowest=TRUE)
+}
+dataset$GarageAreaQBin <- sapply(dataset$GarageArea, ApplyQuintiles)
+
+
+#PorchTotal
+ApplyQuintiles <- function(x) {
+  cut(x, breaks=c(unique(quantile(dataset$PorchTotal, probs = seq(0, 1, by = 0.20)))), 
+      labels=c("1","2","3","4"), include.lowest=TRUE)
+}
+dataset$PorchTotalQBin <- sapply(dataset$PorchTotal, ApplyQuintiles)
+
+
+#WoodDeckSF
+ApplyQuintiles <- function(x) {
+  cut(x, breaks=c(unique(quantile(dataset$WoodDeckSF, probs = seq(0, 1, by = 0.20)))), 
+      labels=c("1","2","3"), include.lowest=TRUE)
+}
+dataset$WoodDeckSFQBin <- sapply(dataset$WoodDeckSF, ApplyQuintiles)
+
+#HouseTotal
+ApplyQuintiles <- function(x) {
+  cut(x, breaks=c(quantile(dataset$HouseTotal, probs = seq(0, 1, by = 0.20))), 
+      labels=c("1","2","3","4","5"), include.lowest=TRUE)
+}
+dataset$HouseTotalQBin <- sapply(dataset$HouseTotal, ApplyQuintiles)
+
+#RemodelledLast
+ApplyQuintiles <- function(x) {
+  cut(x, breaks=c(quantile(dataset$RemodelledLast, probs = seq(0, 1, by = 0.20))), 
+      labels=c("1","2","3","4","5"), include.lowest=TRUE)
+}
+dataset$RemodelledLastBin <- sapply(dataset$RemodelledLast, ApplyQuintiles)
+```
+
+
+
+# Skewness
+### Sales Price
+We now need to detect skewness in the Target value. Let's see what is the effect of skewness on a variable, and plot it using ggplot. The way of getting rid of the skewness is to use the `log` (or the `log1p`) of the values of that feature, to flatten it. To reduce right skewness, take roots or logarithms or reciprocals (x to 1/x). This is the commonest problem in practice. To reduce left skewness, take squares or cubes or higher powers.
+
+```{r}
+df <- rbind(data.frame(version="price",x=dataset$SalePrice),
+            data.frame(version="log(price+1)",x=log(dataset$SalePrice + 1)))
+
+ggplot(data=df) +
+  facet_wrap(~version,ncol=2,scales="free_x") +
+  geom_histogram(aes(x=x), bins = 50)
+```
+
+We therefore transform the target value applying log
+```{r Log transform the target for official scoring}
+# Log transform the target for official scoring
+dataset$SalePrice <- log1p(dataset$SalePrice)
+```
+
+### Other Variables
+```{r}
+n <- sapply(dataset, is.numeric)
+apply(dataset[, n],  2, table)
+```
+
+```{r}
+#Checking all numnerical values which do not represent a ranking. Analysing all the features graphically but only transforming when necessary.
+
+#left skewed --> **2 or **3
+#right skwewed --> log
+
+ggplot(data= dataset) +
+  geom_histogram(aes(x=LotArea), bins = 50)
+dataset$LotArea <- log1p(dataset$LotArea)
+
+ggplot(data= dataset) +
+  geom_histogram(aes(x=LotFrontage), bins = 50)
+
+ggplot(data= dataset) +
+  geom_histogram(aes(x=MasVnrArea), bins = 50)
+
+ggplot(data= dataset) +
+  geom_histogram(aes(x=OverallQual), bins = 50)
+
+ggplot(data= dataset) +
+  geom_histogram(aes(x=OverallCond), bins = 50)
+dataset$LotArea <- log1p(dataset$LotArea)
+
+ggplot(data= dataset) +
+  geom_histogram(aes(x=BsmtFinSF1), bins = 50)
+
+ggplot(data= dataset) +
+  geom_histogram(aes(x=BsmtUnfSF), bins = 50)
+dataset$BsmtUnfSF <- log1p(dataset$BsmtUnfSF)
+
+ggplot(data= dataset) +
+  geom_histogram(aes(x=TotalBsmtSF), bins = 50)
+
+ggplot(data= dataset) +
+  geom_histogram(aes(x=X1stFlrSF), bins = 50)
+dataset$X1stFlrSF <- log1p(dataset$X1stFlrSF)
+
+ggplot(data= dataset) +
+  geom_histogram(aes(x=X2ndFlrSF), bins = 50)
+
+ggplot(data= dataset) +
+  geom_histogram(aes(x=GrLivArea), bins = 50)
+dataset$GrLivArea <- log1p(dataset$GrLivArea)
+
+ggplot(data= dataset) +
+  geom_histogram(aes(x=FireplaceQu), bins = 50)
+
+ggplot(data= dataset) +
+  geom_histogram(aes(x=GarageArea), bins = 50)
+dataset$GarageArea <- log1p(dataset$GarageArea)
+
+ggplot(data= dataset) +
+  geom_histogram(aes(x=WoodDeckSF), bins = 50)
+
+ggplot(data= dataset) +
+  geom_histogram(aes(x=OpenPorchSF), bins = 50)
+dataset$OpenPorchSF <- log1p(dataset$OpenPorchSF)
+
+ggplot(data= dataset) +
+  geom_histogram(aes(x=EnclosedPorch), bins = 50)
+
+ggplot(data= dataset) +
+  geom_histogram(aes(x=X3SsnPorch), bins = 50)
+```
+
+# Outlier Detection
+```{r Train test split}
+training_data <- dataset[1:1460,]
+test <- dataset[1461:2919,]
+```
+
+Instead of going for an automated outlier detection and deletion I decided to inspect each original, not by me engineered, numerical variable visually and consequently decide which values to keep and which to remove. 
+
+Outlier detection is only performed on the training dataset - therefore I performed the split in train and test here. From here on in the process, test set will not be adjusted in any way and will be only used for the final prediction.
+
+```{r Outlier Detection IV}
+plot(training_data$SalePrice, training_data$TotRmsAbvGrd)
+training_data <- training_data[training_data$TotRmsAbvGrd <12,]
+
+plot(training_data$SalePrice, training_data$LotFrontage)
+training_data <- training_data[training_data$LotFrontage <140,]
+
+plot(training_data$SalePrice, training_data$GrLivArea)
+#training_data <- training_data[training_data$GrLivArea <3500,] not necessary anymore after adjusting for skewness
+
+plot(training_data$SalePrice, training_data$LotArea)
+training_data <- training_data[training_data$LotArea <2.5,]
+
+plot(training_data$SalePrice, training_data$X1stFlrSF)
+
+plot(training_data$SalePrice, training_data$X2ndFlrSF)
+
+plot(training_data$SalePrice, training_data$LowQualFinSF)
+
+plot(training_data$SalePrice, training_data$TotalBsmtSF)
+training_data <- training_data[training_data$TotalBsmtSF <2500,]
+
+plot(training_data$SalePrice, training_data$MiscVal)
+training_data <- training_data[training_data$TotalBsmtSF <5000,]
+
+plot(training_data$SalePrice, training_data$GarageArea)
+training_data <- training_data[training_data$TotalBsmtSF <5000,]
+
+plot(training_data$SalePrice, training_data$MasVnrArea)
+training_data <- training_data[training_data$MasVnrArea <1500,]
+
+plot(training_data$SalePrice, training_data$EnclosedPorch)
+
+plot(training_data$SalePrice, training_data$BsmtFinType1)
+
+plot(training_data$SalePrice, training_data$TotRmsAbvGrd)
+training_data <- training_data[training_data$TotRmsAbvGrd >2,]
+
+plot(training_data$SalePrice, training_data$GarageArea)
+
+plot(training_data$SalePrice, training_data$BsmtFinType2)
+
+plot(training_data$SalePrice, training_data$OpenPorchSF)
+#training_data <- training_data[training_data$OpenPorchSF <400,] not necessary anymore after adjusting for skewness
+
+plot(training_data$SalePrice, training_data$WoodDeckSF)
+
+plot(training_data$SalePrice, training_data$MiscVal)
+training_data <- training_data[training_data$MiscVal <15000,]
+
+plot(training_data$SalePrice, training_data$FullBath)
+
+plot(training_data$SalePrice, training_data$HalfBath)
+
+plot(training_data$SalePrice, training_data$BsmtHalfBath)
+training_data <- training_data[training_data$BsmtHalfBath <2,]
+
+plot(training_data$SalePrice, training_data$BsmtFullBath)
+training_data <- training_data[training_data$BsmtFullBath <3,]
+
+plot(training_data$SalePrice, training_data$BedroomAbvGr)
+
+plot(training_data$SalePrice, training_data$KitchenAbvGr)
+training_data <- training_data[training_data$KitchenAbvGr <3,]
+
+plot(training_data$SalePrice, training_data$TotRmsAbvGrd)
+training_data <- training_data[training_data$TotRmsAbvGrd <12,]
+
+nrow(training_data)
+```
+
+Performing outlier detection and deletion, left me with 1418 rows, meaning I removed 42 outliers.
+
+# Feature Selection
+
+Here we start the Feature Selection.
+
+## Dropping Columns Consisting Mainly of 1 Instance.
+
+I decided to drop all the columns which mainly consists out of one instance of the variable and solely out of 1 variable.
+
+```{r}
+#Checking which categorical values consist maninly of one factor - based on original dataset
+original_training_data_x = read.csv(file = file.path("/Users/chrs/Desktop/IE/ML II/First_Assignment/house-prices-advanced-regression-techniques/train.csv"))
+original_test_data_x = read.csv(file = file.path("/Users/chrs/Desktop/IE/ML II/First_Assignment/house-prices-advanced-regression-techniques/test.csv"))
+original_test_data_x$SalePrice <- 0
+dataset_x <- rbind(original_training_data_x, original_test_data_x)
+
+f <- sapply(dataset_x, is.factor) 
+apply(dataset_x[, f],  2, table)
+
+#Deleting the following columns
+#Utilities has only 1 deviating fromn the most column values
+#Street has only 12 deviating fromn the most column values
+#Condition 2 has only 15 deviating fromn the most column values
+
+#Checking which categorical values consist maninly of one factor - based on cleaned dataset
+f <- sapply(training_data, is.factor)
+apply(training_data[, f],  2, table)
+
+#Deleting the following columns
+#Roofmatl has only 17 deviating fromn the most column values
+#Heating has only 29 deviating fromn the most column values
+#Removing factors which have only one value
+#Columns not mentioned in comments but still deleted below consist only out of 1 value after all the transformation I applied. 
+cols_to_delete <- c("Utilities","Street", "RoofMatl", "Heating", "Condition2", "PavedDriveIsPaved","IsExterQualBad", "IsExterQualGood", "IsExterCondlBad", "IsExterCondlGood", "IsHeatingQCBad", "IsHeatingQCGood", "IsKitchenQualBad", "IsKitchenQualGood", "IsPoolQCBad", "IsPoolQCGood") 
+training_data <- training_data[, ! names(training_data) %in% cols_to_delete, drop = F]
+```
+
+## Filtering Methods
+### Train & Validation Split
+
+To apply filter method the training data set will furthe be split in another training and a validation set.
+
+```{r}
+#training_data - complete trainset
+#training - trainset for modelling
+#validation - validationset for modelling
+
+splitdf_train_val <- function(dataframe) {
+  set.seed(123)
+ 	index <- 1:nrow(dataframe)
+ 	trainindex <- sample(index, trunc(length(index)/1.5))
+ 	trainset <- dataframe[trainindex, ]
+ 	validationset <- dataframe[-trainindex, ]
+ 	list(trainset=trainset,validationset=validationset)
+}
+
+split_train_val <- splitdf_train_val(training_data)
+training <- split_train_val$trainset
+validation <- split_train_val$validationset
+
+nrow(training)
+nrow(validation)
+```
+
+
+We will rank the features according to their predictive power according to the methodologies seen in class: the Chi Squared Independence test
+
+
+### Baseline Model Including ALL Variables
+
+As a first step I created a baseline including all the features to evaluate the impact of the feature engineering.
+
+```{r message=FALSE, warning=FALSE}
+lm.model(training, validation, "Baseline")
+```
+
+### Chi-squared Selection
+
+We make use of the Chi-squared test to tell use which variables to use for our final model.
+
+```{r warning=FALSE}
+# Compute the ChiSquared Statistic over the factor features ONLY
+features <- names(training[, sapply(training, is.factor) & colnames(training) != 'SalePrice'])
+
+chisquared <- data.frame(features, statistic = sapply(features, function(x) {
+  chisq.test(training$SalePrice, training[[x]])$statistic
+}))
+
+chisq.test(training$SalePrice, training$LotShape)
+
+# Plot the result, and remove those below the 2nd IQR (inter-quartile-range) --aggressive
+par(mfrow=c(1,2))
+boxplot(chisquared$statistic)
+bp.stats <- boxplot.stats(chisquared$statistic)$stats   # Get the statistics from the boxplot
+
+chisquared.threshold = bp.stats[3]  # This element represent the 2nd quartile.
+text(y = bp.stats, labels = bp.stats, x = 1.3, cex=0.7)
+barplot(sort(chisquared$statistic), names.arg = chisquared$features, cex.names = 0.6, las=2, horiz = T)
+abline(v=chisquared.threshold, col='red')  # Draw a red line over the 1st IQR
+```
+
+Now, we can test if this a good move, by removing any feature with a Chi Squared test statistic against the output below the 1 IQR.
+
+```{r message=FALSE, warning=FALSE}
+# Determine what features to remove from the training set.
+#0.1406 1st quartile; 2nd quartile: 0.1382 -MSSubclass 0.1370
+features_to_remove <- as.character(chisquared[chisquared$statistic < chisquared.threshold, "features"])
+features_to_remove <- c(features_to_remove, "MSSubClass") #adding MSSubClass manually decreased the MOdel RMSE even further
+lm.model(training[!names(training) %in% features_to_remove], validation, "ChiSquared Model")
+```
+
+Choosing only variables which pass the Chi-Square test with a 2nd quartile cut-off poin, improved the model compared to the baseline model from 0.1411 to 0.1370. 
+
+### Spearman's Correlation Selection
+
+What to do with the numerical variables? We can always measure its relation with the outcome through the Spearman's correlation coefficient, and remove those with a lower value. Let's repeat the same process we did with the Chi Square but modifying our code to solely select numerical features and measuring Spearman'.
+
+```{r}
+# Compute the ChiSquared Statistic over the factor features ONLY
+features <- names(training[, sapply(training, is.numeric) & colnames(training) != 'SalePrice']) #CORREC GIVES FEATURES
+spearman <- data.frame(features, statistic = sapply(features, function(x) {
+  cor(training$SalePrice, training[[x]], method='spearman')
+}))
+
+# Plot the result, and remove those below the 1st IQR (inter-quartile-range) --aggressive
+par(mfrow=c(1,2))
+boxplot(abs(spearman$statistic))
+bp.stats <- boxplot.stats(abs(spearman$statistic))$stats   # Get the statistics from the boxplot
+text(y = bp.stats, 
+     labels = sapply(bp.stats, function(x){format(round(x, 3), nsmall=3)}), # This is to reduce the nr of decimals
+     x = 1.3, cex=0.7)
+
+spearman.threshold = bp.stats[2]  # This element represent the 1st quartile.
+
+barplot(sort(abs(spearman$statistic)), names.arg = spearman$features, cex.names = 0.6, las=2, horiz = T)
+abline(v=spearman.threshold, col='red')  # Draw a red line over the 1st IQR
+```
+
+So, how good is our feature cleaning process? Let's train the model with the new features, exactly as we did in the Chi Sq. section above.
+
+```{r message=FALSE, warning=FALSE}
+# Determine what features to remove from the training set.
+features_to_remove_num <- as.character(spearman[spearman$statistic < spearman.threshold, "features"]) #only numeric features to remove
+features_to_remove_total <- c(features_to_remove, features_to_remove_num) #categorical and numeric (from the chi-squared test) features to remove
+lm.model(training[!names(training) %in% features_to_remove_num], validation, "ChiSquared Model")
+
+training_after_chi_sp <- training[!names(training) %in% features_to_remove_total] #only train split
+training_data_after_chi_sp <- training_data[!names(training_data) %in% features_to_remove_total] #complete training set (train + val)
+```
+
+Comparing to our baseline model the RMSE has again decreased from 0.1411 to 0.1396 - so the gain was not as strong as when removing categorical variables.
+
+```{r}
+lm.model(training[!names(training) %in% features_to_remove_total], validation, "ChiSquared Model")
+```
+
+However, when running our model only with the features left after applying Chi-Squared and SPEARMEN analysis, the model actually becomes a bit more unprecise compared to the model based on the dataset after Chi-Squared selection alone.
+
+## Embedded Methods
+### Ridge Regression
+
+To calculate the ridge regression we are going to make use of the <a href="https://cran.r-project.org/web/packages/glmnet/index.html">`glmnet`</a> library which provides the possibility to create glmnet model for Ridge Regression, using a grid of lambda values.
+
+```{r Ridge Regression, warning=FALSE}
+lambdas <- 10^seq(-3, 0, by = .05)
+
+set.seed(121)
+train_control_config <- trainControl(method = "repeatedcv", 
+                                     number = 5, 
+                                     repeats = 1,
+                                     returnResamp = "all")
+
+ridge.mod <- train(SalePrice ~ ., data = training, #training_data for final model
+               method = "glmnet", 
+               metric = "RMSE",
+               trControl=train_control_config,
+               tuneGrid = expand.grid(alpha = 0, lambda = lambdas))
+
+ridge.mod
+```
+
+
+The parameter `alpha = 0` means that we want to use the Ridge Regression way of expressing the penalty in regularization. If you replace that by `alpha = 1` then you get Lasso.
+
+#### Ridge Regression Evaluation
+
+Plotting the RMSE for the different lambda values, we can see the impact of this parameter in the model performance.
+
+```{r Ridge RMSE}
+plot(ridge.mod)
+```
+
+```{r Ridge Coefficients}
+plot(ridge.mod$finalModel)
+```
+
+```{r Ridge Evaluation}
+ridge.mod.pred <- predict(ridge.mod, validation)
+ridge.mod.pred[is.na(ridge.mod.pred)] <- 0
+
+my_data <- as.data.frame(cbind(predicted=(exp(ridge.mod.pred) -1), observed=(exp(validation$SalePrice) -1)))
+ridge.mod.rmse <- sqrt(mean((ridge.mod.pred - validation$SalePrice)^2))
+ridge.mod.price_error <- mean(abs((exp(ridge.mod.pred) -1) - (exp(validation$SalePrice) -1)))
+
+ggplot(my_data, aes(predicted, observed)) +
+    geom_point() + geom_smooth(method = "glm") +
+    labs(x="Predicted") +
+    ggtitle(ggtitle(paste("Ridge", 'RMSE: ', format(round(ridge.mod.rmse, 4), nsmall=4), ' --> Price ERROR:', format(round(ridge.mod.price_error, 0), nsmall=0), 
+                        ' €', sep=''))) +  
+    scale_x_continuous(labels = scales::comma) + 
+    scale_y_continuous(labels = scales::comma)
+```
+
+Running a ridge regression provides by far the best RMSE: 0.1217. Therefore, I used the Ridge Regression to run train the final model.
+
+Rank the variables according to the importance attributed by the model.
+```{r}
+# Print, plot variable importance
+plot(varImp(ridge.mod), top = 20) # 20 most important features
+```
+
+# Final Submission
+
+We splitted the original training data into train and validation to evaluate the candidate models. In order to generate the final submission we have to take instead all the data at our disposal.
+In addition, remember that we also applied a log transformation to the target variable, to revert this transformation I use the exp function.
+
+```{r Final Submission}
+ridge.mod <- train(SalePrice ~ ., data = training_data, #training_data for final model
+               method = "glmnet", 
+               metric = "RMSE",
+               trControl=train_control_config,
+               tuneGrid = expand.grid(alpha = 0, lambda = lambdas))
+
+final.pred <- as.numeric(exp(predict(ridge.mod, test))-1) 
+final.pred[is.na(final.pred)]
+hist(final.pred, main="Histogram of Predictions", xlab = "Predictions")
+
+lasso_submission <- data.frame(Id = original_test_data$Id, SalePrice= (final.pred))
+colnames(lasso_submission) <-c("Id", "SalePrice")
+write.csv(lasso_submission, file = "submission.csv", row.names = FALSE) 
+```
