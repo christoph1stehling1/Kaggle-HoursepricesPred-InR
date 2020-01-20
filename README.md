@@ -6,6 +6,6 @@ Achieved score: 0.12085 (root mean squared logarithmic error) - top 20% at time 
 
 ------------------------------------------------------------------------------------------------------------------------------
 
-As one of our first coding projects of my Master's in Business Analytics and Big Data at IE Businees School/IE School of Human Sciences and Technology in Madrid, we were tasked to compete in a Kaggle competition that would account for 25% of our total grade in the subject "Machine Learning II".
+As one of my first coding projects, I decided to compete in a popular Kaggle competition to predict house prices. 
 
 
