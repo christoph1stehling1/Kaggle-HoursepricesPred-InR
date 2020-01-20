@@ -1,4 +1,4 @@
-# Kaggle Competition: House Prices: Advanced Regression Techniques - Top 20%
+# Kaggle Competition: 'House Prices: Advanced Regression Techniques' - Top 20%
 
 Link to competition: https://www.kaggle.com/c/house-prices-advanced-regression-techniques
 
